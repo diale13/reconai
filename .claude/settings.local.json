@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile reconai.py)",
+      "Bash(python3 -m py_compile \"C:\\\\Users\\\\Usuario\\\\Desktop\\\\Owasp\\\\reconai.py\")",
+      "PowerShell(py -m py_compile \"C:\\\\Users\\\\Usuario\\\\Desktop\\\\Owasp\\\\reconai.py\")",
+      "PowerShell(if \\($?\\) { \"OK\" } else { \"FAIL\" })",
+      "PowerShell($env:PATH -split \";\" | Where-Object { $_ -ne \"\" })",
+      "Bash(pip install *)",
+      "Bash(python3 reconai.py --help)",
+      "Bash(python3 reconai.py --mode bad --input nofile.txt)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"acme.com\")",
+      "Bash(python3 reconai.py --mode domain --input test_seeds.txt --api-key testkey123)",
+      "Bash(python3 reconai.py --mode url --input test_seeds.txt --api-key testkey123)",
+      "Bash(echo \"# just a comment\")",
+      "Bash(python3 reconai.py --mode url --input empty_input.txt --api-key testkey123)",
+      "Bash(python3 reconai.py --mode url --input test_seeds.txt --api-key testkey123 --rounds 0 --delay -1 --candidates 0)"
+    ]
+  }
+}
