@@ -8,6 +8,7 @@ __pycache__/
 
 #Extra
 SPEC.md
+.claude
 
 # Distribution / packaging
 .Python
