@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import anthropic
+from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
@@ -273,7 +274,7 @@ def call_llm(
     user_message: str,
     api_key: str,
     model: str,
-    base_url: str | None,
+    base_url: Optional[str],
     delay: float,
 ) -> list[str]:
     """Calls Claude API (or local model). Returns list of candidates parsed from response."""
@@ -691,19 +692,85 @@ def validate_config(args) -> list[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="reconai",
-        description="AI-augmented subdomain and endpoint enumeration.",
+        description=(
+            "reconai — AI-augmented subdomain and endpoint enumeration.\n\n"
+            "Uses Claude to iteratively generate and validate subdomains (domain mode)\n"
+            "or URL paths (url mode) based on patterns in already-confirmed targets."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "modes:\n"
+            "  domain  passive subdomain discovery via subfinder → DNS validation (dnsx)\n"
+            "          → AI generation → DNS validation → HTTP probing (httpx)\n"
+            "  url     HTTP probing of seed URLs → AI generation of new paths\n"
+            "          → HTTP probing → repeat\n\n"
+            "required tools (auto-detected):\n"
+            "  domain mode : subfinder, dnsx, httpx  (projectdiscovery.io)\n"
+            "  url mode    : httpx\n\n"
+            "examples:\n"
+            "  reconai --mode domain --input domains.txt\n"
+            "  reconai --mode domain --input domains.txt --scope scope.txt --rounds 5\n"
+            "  reconai --mode url    --input urls.txt    --candidates 100 --output run1\n"
+            "  reconai --mode domain --input domains.txt --context 'e-commerce platform'\n\n"
+            "api key:\n"
+            "  Pass --api-key or set the ANTHROPIC_API_KEY environment variable."
+        ),
     )
-    parser.add_argument("--mode", required=True, help="'domain' or 'url'")
-    parser.add_argument("--input", required=True, help="Path to input .txt file")
-    parser.add_argument("--context", default="", help="Free text appended to LLM system prompt")
-    parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS, help="Number of generate->validate->feedback cycles")
-    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Seconds to sleep between outbound requests")
-    parser.add_argument("--scope", default=None, help="Path to scope file, one apex domain per line")
-    parser.add_argument("--api-key", default=None, dest="api_key", help="Claude API key")
-    parser.add_argument("--llm-url", default=None, dest="llm_url", help="Custom base URL for LLM API")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model string passed to API")
-    parser.add_argument("--output", default="reconai_output", help="Base name for output files")
-    parser.add_argument("--candidates", type=int, default=DEFAULT_CANDIDATES, help="Candidates to request from LLM per round")
+    parser.add_argument(
+        "--mode", required=True,
+        metavar="MODE",
+        help="enumeration mode: 'domain' (subdomain discovery) or 'url' (endpoint discovery)",
+    )
+    parser.add_argument(
+        "--input", required=True,
+        metavar="FILE",
+        help="path to input file — apex domains (domain mode) or seed URLs (url mode), one per line",
+    )
+    parser.add_argument(
+        "--context", default="",
+        metavar="TEXT",
+        help="free-text description of the target appended to the LLM system prompt (e.g. 'fintech SaaS')",
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=DEFAULT_ROUNDS,
+        metavar="N",
+        help=f"number of generate → validate → feedback cycles (default: {DEFAULT_ROUNDS})",
+    )
+    parser.add_argument(
+        "--delay", type=float, default=DEFAULT_DELAY,
+        metavar="SECS",
+        help=f"seconds to sleep between outbound requests (default: {DEFAULT_DELAY})",
+    )
+    parser.add_argument(
+        "--scope", default=None,
+        metavar="FILE",
+        help="path to scope file — one apex domain per line; out-of-scope results are dropped",
+    )
+    parser.add_argument(
+        "--api-key", default=None, dest="api_key",
+        metavar="KEY",
+        help="Claude API key (overrides ANTHROPIC_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--llm-url", default=None, dest="llm_url",
+        metavar="URL",
+        help="custom base URL for the LLM API (e.g. a local proxy or compatible endpoint)",
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        metavar="MODEL",
+        help=f"Claude model string passed to the API (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--output", default="reconai_output",
+        metavar="BASENAME",
+        help="base name for output files — .txt and .html are appended (default: reconai_output)",
+    )
+    parser.add_argument(
+        "--candidates", type=int, default=DEFAULT_CANDIDATES,
+        metavar="N",
+        help=f"number of candidates to request from the LLM per round (default: {DEFAULT_CANDIDATES})",
+    )
     return parser.parse_args()
 
 
