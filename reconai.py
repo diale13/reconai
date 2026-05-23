@@ -17,7 +17,7 @@ import anthropic
 from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_ROUNDS = 3
 DEFAULT_DELAY = 1.0
 DEFAULT_CANDIDATES = 50
@@ -26,6 +26,7 @@ DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 REQUIRED_BINARIES = {
     "domain": ["subfinder", "dnsx", "httpx"],
     "url": ["httpx"],
+    "llm": ["dnsx", "httpx"],
 }
 
 
@@ -260,7 +261,7 @@ def build_url_system_prompt(context: str, candidates: int) -> str:
 
 
 def build_user_message(confirmed: list[str], mode: str, candidates: int) -> str:
-    mode_label = "subdomains" if mode == "domain" else "URLs"
+    mode_label = "subdomains" if mode in ("domain", "llm") else "URLs"
     confirmed_list = "\n".join(sorted(confirmed))
     return (
         f"Confirmed {mode_label} discovered so far ({len(confirmed)} total):\n\n"
@@ -276,6 +277,7 @@ def call_llm(
     model: str,
     base_url: Optional[str],
     delay: float,
+    debug: bool = False,
 ) -> list[str]:
     """Calls Claude API (or local model). Returns list of candidates parsed from response."""
     try:
@@ -291,6 +293,15 @@ def call_llm(
             messages=[{"role": "user", "content": user_message}],
         )
         raw = response.content[0].text
+
+        if debug:
+            print("[DEBUG] Raw LLM response:")
+            print("-" * 40)
+            print(raw[:2000])
+            if len(raw) > 2000:
+                print(f"  ... ({len(raw) - 2000} more chars truncated)")
+            print("-" * 40)
+
         candidates = []
         for line in raw.splitlines():
             line = line.strip()
@@ -299,6 +310,8 @@ def call_llm(
             if line.startswith("#"):
                 continue
             if " " in line:
+                if debug:
+                    print(f"[DEBUG] Filtered (contains space): {line!r}")
                 continue
             candidates.append(line)
         return candidates
@@ -349,6 +362,7 @@ def run_domain_mode(config: dict) -> dict:
         raw_candidates = call_llm(
             system_prompt, user_message,
             config["api_key"], config["model"], config["llm_url"], config["delay"],
+            debug=config.get("debug", False),
         )
         print(f"  [*] LLM returned {len(raw_candidates)} candidates")
 
@@ -418,6 +432,85 @@ def run_domain_mode(config: dict) -> dict:
     }
 
 
+def run_llm_mode(config: dict) -> dict:
+    """LLM-only domain mode — skips subfinder, seeds the LLM directly. Returns results dict."""
+    seeds = load_lines(config["input"])
+    seeds, seed_rejected = filter_scope(seeds, config["scope_domains"])
+    print(f"[*] Loaded {len(seeds)} seed domains")
+    scope_rejected = seed_rejected
+
+    scope_status = f"enabled ({config['scope_file']})" if config["scope_domains"] else "disabled"
+    print(f"[*] Scope: {scope_status}")
+    print(f"[*] Skipping subfinder — seeding LLM directly with {len(seeds)} domains")
+
+    confirmed_domains: set[str] = set(seeds)
+    alive_hosts: list[dict] = []
+    rounds_summary: list[dict] = []
+    all_candidates_ever: set[str] = set()
+
+    for round_num in range(1, config["rounds"] + 1):
+        print(f"\n[Round {round_num}/{config['rounds']}]")
+
+        system_prompt = build_domain_system_prompt(config["context"], config["candidates"])
+        user_message = build_user_message(list(confirmed_domains), "domain", config["candidates"])
+
+        print(f"  [*] Calling LLM (context: {len(confirmed_domains)} confirmed subdomains)...")
+        raw_candidates = call_llm(
+            system_prompt, user_message,
+            config["api_key"], config["model"], config["llm_url"], config["delay"],
+            debug=config.get("debug", False),
+        )
+        print(f"  [*] LLM returned {len(raw_candidates)} candidates")
+
+        if not raw_candidates:
+            print("  [WARN] LLM returned no candidates this round.")
+            rounds_summary.append({"round": round_num, "llm": 0, "scope_filtered": 0, "dns": 0, "alive": 0})
+            continue
+
+        kept, rej = filter_scope(raw_candidates, config["scope_domains"])
+        scope_rejected += rej
+        print(f"  [*] Scope filtered: {rej}")
+
+        new_candidates = [c for c in kept if c not in confirmed_domains]
+        all_candidates_ever.update(new_candidates)
+        print(f"  [*] Deduped: {len(new_candidates)} new candidates to validate")
+
+        print("  [*] DNS validation...")
+        newly_resolved = run_dnsx(new_candidates, config["delay"])
+        print(f"  [+] {len(newly_resolved)} new subdomains resolved")
+
+        if not newly_resolved:
+            print("  No new domains resolved this round.")
+            rounds_summary.append({"round": round_num, "llm": len(raw_candidates), "scope_filtered": rej, "dns": 0, "alive": 0})
+            continue
+
+        confirmed_domains.update(newly_resolved)
+
+        ua = random.choice(config["user_agents"])
+        print(f"  [*] HTTP probing {len(newly_resolved)} new subdomains...")
+        new_alive = run_httpx(newly_resolved, ua, config["delay"])
+        print(f"  [+] {len(new_alive)} alive")
+        alive_hosts.extend(new_alive)
+
+        rounds_summary.append({
+            "round": round_num,
+            "llm": len(raw_candidates),
+            "scope_filtered": rej,
+            "dns": len(newly_resolved),
+            "alive": len(new_alive),
+        })
+
+    return {
+        "mode": "llm",
+        "seeds": seeds,
+        "confirmed_domains": list(confirmed_domains),
+        "alive_hosts": alive_hosts,
+        "all_candidates": list(all_candidates_ever),
+        "scope_rejected": scope_rejected,
+        "rounds_summary": rounds_summary,
+    }
+
+
 def run_url_mode(config: dict) -> dict:
     """Full URL mode pipeline. Returns results dict."""
     seeds = load_lines(config["input"])
@@ -442,6 +535,7 @@ def run_url_mode(config: dict) -> dict:
         raw_candidates = call_llm(
             system_prompt, user_message,
             config["api_key"], config["model"], config["llm_url"], config["delay"],
+            debug=config.get("debug", False),
         )
         print(f"  [*] LLM returned {len(raw_candidates)} candidates")
 
@@ -504,7 +598,7 @@ def write_txt_output(results: dict, config: dict):
     alive_hosts = results["alive_hosts"]
     alive_urls = {h["url"] for h in alive_hosts}
 
-    if mode == "domain":
+    if mode in ("domain", "llm"):
         confirmed = set(results["confirmed_domains"])
         dns_only = sorted(confirmed - {
             h["url"].replace("https://", "").replace("http://", "").split("/")[0]
@@ -517,6 +611,10 @@ def write_txt_output(results: dict, config: dict):
         confirmed_urls = set(results["confirmed_urls"])
         dns_only = sorted(confirmed_urls - alive_urls)
         candidates_not_resolved = []
+
+    seeds_set = set(results.get("seeds", []))
+    llm_alive = [h for h in alive_hosts if
+                 h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
 
     lines = [
         "# reconai output",
@@ -531,6 +629,10 @@ def write_txt_output(results: dict, config: dict):
     ]
     for h in alive_hosts:
         lines.append(_fmt_alive_line(h))
+
+    if mode == "llm":
+        lines += ["", "## LLM-DISCOVERED & ALIVE"]
+        lines += [_fmt_alive_line(h) for h in llm_alive] if llm_alive else ["(none)"]
 
     lines += ["", "## CONFIRMED (DNS resolved, not HTTP probed or not alive)"]
     lines += dns_only if dns_only else ["(none)"]
@@ -555,7 +657,7 @@ def write_html_output(results: dict, config: dict):
     alive_hosts = results["alive_hosts"]
     alive_urls = {h["url"] for h in alive_hosts}
 
-    if mode == "domain":
+    if mode in ("domain", "llm"):
         confirmed = set(results["confirmed_domains"])
         dns_only = sorted(confirmed - {
             h["url"].replace("https://", "").replace("http://", "").split("/")[0]
@@ -569,12 +671,26 @@ def write_html_output(results: dict, config: dict):
         dns_only = sorted(confirmed_urls - alive_urls)
         candidates_not_resolved = []
 
+    seeds_set = set(results.get("seeds", []))
+    llm_alive = [h for h in alive_hosts if
+                 h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
+
     def esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in alive_hosts) or "  <li>(none)</li>"
     dns_items = "\n".join(f"  <li>{esc(d)}</li>" for d in dns_only) or "  <li>(none)</li>"
     cand_items = "\n".join(f"  <li>{esc(c)}</li>" for c in candidates_not_resolved) or "  <li>(none)</li>"
+
+    llm_alive_section = ""
+    if mode == "llm":
+        llm_alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in llm_alive) or "  <li>(none)</li>"
+        llm_alive_section = f"""
+<h2>LLM-Discovered &amp; Alive ({len(llm_alive)})</h2>
+<ul>
+{llm_alive_items}
+</ul>
+"""
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -587,7 +703,7 @@ def write_html_output(results: dict, config: dict):
 <ul>
 {alive_items}
 </ul>
-
+{llm_alive_section}
 <h2>Confirmed — DNS resolved ({len(dns_only)})</h2>
 <ul>
 {dns_items}
@@ -614,8 +730,16 @@ def print_final_summary(results: dict, config: dict):
     print(f"\n{sep}")
     print("reconai | COMPLETE")
     print(sep)
-    if results["mode"] == "domain":
+    if results["mode"] in ("domain", "llm"):
         print(f"  Total confirmed subdomains : {len(results['confirmed_domains'])}")
+        if results["mode"] == "llm":
+            new_domains = sorted(set(results["confirmed_domains"]) - set(results["seeds"]))
+            print(f"  New domains (not in input) : {len(new_domains)}")
+            if new_domains:
+                print()
+                print("  LLM-discovered & DNS-validated:")
+                for d in new_domains:
+                    print(f"    + {d}")
     else:
         print(f"  Total confirmed URLs       : {len(results['confirmed_urls'])}")
     print(f"  Total alive (HTTP)         : {len(results['alive_hosts'])}")
@@ -638,8 +762,8 @@ def validate_config(args) -> list[str]:
     errors = []
 
     # 1. Mode check
-    if args.mode not in ("domain", "url"):
-        errors.append(f"[ERROR] --mode must be 'domain' or 'url', got: {args.mode!r}")
+    if args.mode not in ("domain", "url", "llm"):
+        errors.append(f"[ERROR] --mode must be 'domain', 'url', or 'llm', got: {args.mode!r}")
 
     # 2. Input file exists
     if not os.path.isfile(args.input):
@@ -655,6 +779,11 @@ def validate_config(args) -> list[str]:
                 ]
             if not lines:
                 errors.append(f"[ERROR] Input file is empty (after removing blank lines and comments): {args.input}")
+            # Wildcard check — only relevant for domain mode (subfinder will hang on *.domain.com)
+            if args.mode == "domain":
+                wildcards = [l for l in lines if l.startswith("*")]
+                for w in wildcards:
+                    errors.append(f"[ERROR] Wildcard entry in input file not supported in domain mode: {w!r} — use the apex domain instead (e.g. 'example.com')")
         except OSError as e:
             errors.append(f"[ERROR] Cannot read input file: {e}")
 
@@ -678,7 +807,7 @@ def validate_config(args) -> list[str]:
         errors.append(f"[ERROR] --candidates must be >= 1, got: {args.candidates}")
 
     # 7. Binary checks (only if mode is valid)
-    if args.mode in ("domain", "url"):
+    if args.mode in ("domain", "url", "llm"):
         missing = check_binaries(args.mode)
         for binary in missing:
             errors.append(
@@ -702,13 +831,17 @@ def parse_args() -> argparse.Namespace:
             "modes:\n"
             "  domain  passive subdomain discovery via subfinder → DNS validation (dnsx)\n"
             "          → AI generation → DNS validation → HTTP probing (httpx)\n"
+            "  llm     AI generation only (no subfinder) → DNS validation → HTTP probing\n"
+            "          seeds the LLM directly from the input file\n"
             "  url     HTTP probing of seed URLs → AI generation of new paths\n"
             "          → HTTP probing → repeat\n\n"
             "required tools (auto-detected):\n"
             "  domain mode : subfinder, dnsx, httpx  (projectdiscovery.io)\n"
+            "  llm mode    : dnsx, httpx\n"
             "  url mode    : httpx\n\n"
             "examples:\n"
             "  reconai --mode domain --input domains.txt\n"
+            "  reconai --mode llm    --input domains.txt --rounds 5\n"
             "  reconai --mode domain --input domains.txt --scope scope.txt --rounds 5\n"
             "  reconai --mode url    --input urls.txt    --candidates 100 --output run1\n"
             "  reconai --mode domain --input domains.txt --context 'e-commerce platform'\n\n"
@@ -719,7 +852,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode", required=True,
         metavar="MODE",
-        help="enumeration mode: 'domain' (subdomain discovery) or 'url' (endpoint discovery)",
+        help="enumeration mode: 'domain' (subfinder + AI), 'llm' (AI only, no subfinder), or 'url' (endpoint discovery)",
     )
     parser.add_argument(
         "--input", required=True,
@@ -771,6 +904,10 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help=f"number of candidates to request from the LLM per round (default: {DEFAULT_CANDIDATES})",
     )
+    parser.add_argument(
+        "--debug", action="store_true", default=False,
+        help="print raw LLM responses and filtered lines for troubleshooting",
+    )
     return parser.parse_args()
 
 
@@ -807,6 +944,7 @@ def main():
         "output": args.output,
         "candidates": args.candidates,
         "user_agents": user_agents,
+        "debug": args.debug,
     }
 
     sep = "=" * 60
@@ -819,6 +957,8 @@ def main():
     try:
         if config["mode"] == "domain":
             results = run_domain_mode(config)
+        elif config["mode"] == "llm":
+            results = run_llm_mode(config)
         else:
             results = run_url_mode(config)
     except KeyboardInterrupt:
