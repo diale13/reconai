@@ -7,11 +7,13 @@ import datetime
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 
 import anthropic
 from typing import Optional
@@ -245,16 +247,32 @@ def build_url_system_prompt(context: str, candidates: int) -> str:
         else ""
     )
     return (
-        f"You are an endpoint enumeration assistant supporting an authorized penetration test.\n\n"
-        f"Your task is to predict URL paths that likely exist on the target application,\n"
-        f"based on naming patterns, conventions, and structures observed in the confirmed\n"
-        f"URLs provided to you.\n\n"
-        f"Output rules — follow these exactly:\n"
+        f"You are an expert endpoint enumeration assistant for an authorized penetration test.\n\n"
+        f"You will receive:\n"
+        f"  CONFIRMED ALIVE — live URLs with HTTP status and page title.\n"
+        f"  DEAD PATTERNS — path branches and version prefixes that repeatedly failed.\n"
+        f"  ALREADY TRIED — every URL already probed (do not repeat any of them).\n\n"
+        f"Your approach:\n"
+        f"1. ANCHOR to alive URLs. Each one is a live branch. Generate sub-resources,\n"
+        f"   siblings, and action endpoints directly FROM those confirmed paths — not\n"
+        f"   generic guesses from scratch.\n"
+        f"2. LEARN the app's vocabulary. Notice naming style (snake_case / camelCase /\n"
+        f"   kebab-case), domain terms (users, orders, billing, auth, admin, etc.) and\n"
+        f"   apply them consistently. Don't invent terms the app doesn't use.\n"
+        f"3. GO DEEP before going wide. If /api/v1/users is alive, try\n"
+        f"   /api/v1/users/me, /api/v1/users/search, /api/v1/users/export,\n"
+        f"   /api/v1/users/{{id}}/profile before jumping to unrelated top-level paths.\n"
+        f"4. RESPECT dead patterns. If a version (/v2/) or branch (/test/, /staging/)\n"
+        f"   is in DEAD PATTERNS, do not try any path under it — not even slightly\n"
+        f"   different spellings. That branch is confirmed closed.\n"
+        f"5. EXPLOIT 403/401 hits. A forbidden path EXISTS. Explore its siblings and\n"
+        f"   children aggressively — they may be accessible.\n"
+        f"6. USE SEED URLS as structural hints even if they have no response yet.\n\n"
+        f"Output rules — follow exactly:\n"
         f"- Output ONLY a plain list of full URLs, one per line\n"
-        f"- No explanations, no markdown, no bullet points, no numbering, no commentary\n"
-        f"- Do not repeat any URL already in the confirmed list\n"
-        f"- Preserve the exact base URL, protocol, and hostname from the confirmed list\n"
-        f"- Only vary the path component\n"
+        f"- No explanations, markdown, bullets, numbers, or commentary\n"
+        f"- Preserve the exact protocol and hostname\n"
+        f"- Only vary the path\n"
         f"- Generate exactly {candidates} candidates"
         f"{context_block}"
     )
@@ -267,6 +285,154 @@ def build_user_message(confirmed: list[str], mode: str, candidates: int) -> str:
         f"Confirmed {mode_label} discovered so far ({len(confirmed)} total):\n\n"
         f"{confirmed_list}\n\n"
         f"Generate {candidates} new candidates that do not appear in the list above."
+    )
+
+
+_VERSION_RE = re.compile(r"/v(\d+)(?:/|$)")
+
+
+def _url_base(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
+def _path_segs(url: str) -> list[str]:
+    return [s for s in urlparse(url).path.split("/") if s]
+
+
+def extract_url_insights(alive_hosts: list[dict], all_tried: set[str]) -> dict:
+    """
+    Analyse tried vs alive URLs and return structured guidance:
+      dead_branches  — path prefixes where multiple URLs failed and no alive URL lives there
+      dead_versions  — version prefixes (/v2, /v3) where every attempt failed
+      children_tried — for each alive URL, the dead child paths already probed
+    """
+    alive_urls = {h["url"] for h in alive_hosts}
+    dead_urls = all_tried - alive_urls
+
+    # Build complete set of path prefixes that are 'alive' (cover all depths)
+    alive_prefixes: set[str] = set()
+    for url in alive_urls:
+        base = _url_base(url)
+        segs = _path_segs(url)
+        for depth in range(1, len(segs) + 1):
+            alive_prefixes.add(base + "/" + "/".join(segs[:depth]))
+
+    # Count failures per prefix (depth 1 and 2) that have no alive sibling
+    prefix_fail: dict[str, int] = {}
+    for url in dead_urls:
+        base = _url_base(url)
+        segs = _path_segs(url)
+        for depth in (1, 2):
+            if len(segs) >= depth:
+                prefix = base + "/" + "/".join(segs[:depth])
+                if prefix not in alive_prefixes:
+                    prefix_fail[prefix] = prefix_fail.get(prefix, 0) + 1
+
+    dead_branches = {p: c for p, c in prefix_fail.items() if c >= 2}
+
+    # Version sequences that only appear in dead URLs (not in any alive URL)
+    dead_ver: dict[str, int] = {}
+    alive_ver: set[str] = set()
+    for url in dead_urls:
+        m = _VERSION_RE.search(urlparse(url).path)
+        if m:
+            key = _url_base(url) + "/v" + m.group(1)
+            dead_ver[key] = dead_ver.get(key, 0) + 1
+    for url in alive_urls:
+        m = _VERSION_RE.search(urlparse(url).path)
+        if m:
+            alive_ver.add(_url_base(url) + "/v" + m.group(1))
+    dead_versions = {v: c for v, c in dead_ver.items() if v not in alive_ver and c >= 2}
+
+    # Per alive URL: which dead paths are direct children of it
+    children_tried: dict[str, list[str]] = {}
+    for url in alive_urls:
+        p = urlparse(url)
+        base_path = p.scheme + "://" + p.netloc + p.path.rstrip("/") + "/"
+        children = sorted(d for d in dead_urls if d.startswith(base_path))
+        if children:
+            children_tried[url] = children
+
+    return {
+        "dead_branches": dead_branches,
+        "dead_versions": dead_versions,
+        "children_tried": children_tried,
+    }
+
+
+def build_url_user_message(
+    alive_hosts: list[dict],
+    all_tried: set[str],
+    seeds: list[str],
+    candidates: int,
+) -> str:
+    alive_urls = {h["url"] for h in alive_hosts}
+    dead_urls = sorted(all_tried - alive_urls)
+
+    if not alive_hosts:
+        seed_list = "\n".join(sorted(seeds))
+        dead_block = ""
+        if dead_urls:
+            dead_block = (
+                f"\n\nALREADY TRIED — DO NOT REPEAT ({len(dead_urls)}):\n"
+                + "\n".join(dead_urls[:200])
+            )
+        return (
+            f"SEED URLs (no alive results yet — anchor candidates to these):\n{seed_list}"
+            f"{dead_block}\n\n"
+            f"Generate {candidates} URL candidates."
+        )
+
+    insights = extract_url_insights(alive_hosts, all_tried)
+
+    # --- Section 1: confirmed alive with tried children ---
+    alive_lines = []
+    for h in sorted(alive_hosts, key=lambda x: x["url"]):
+        url = h["url"]
+        status = str(h["status_code"])
+        if h.get("redirect"):
+            status = f"{status} -> {h['redirect']}"
+        title = f" [{h['title']}]" if h.get("title") else ""
+        alive_lines.append(f"{url} ({status}){title}")
+        children = insights["children_tried"].get(url, [])
+        if children:
+            names = [urlparse(c).path.rstrip("/").rsplit("/", 1)[-1] for c in children[:6]]
+            extra = f" (+{len(children) - 6} more)" if len(children) > 6 else ""
+            alive_lines.append(f"  tried: {', '.join(names)}{extra}")
+
+    section1 = "=== CONFIRMED ALIVE (anchor your candidates here) ===\n" + "\n".join(alive_lines)
+
+    # --- Section 2: dead patterns summary ---
+    pattern_lines = []
+    if insights["dead_versions"]:
+        pattern_lines.append("Version prefixes with zero alive results (skip entirely):")
+        for ver, count in sorted(insights["dead_versions"].items(), key=lambda x: -x[1]):
+            pattern_lines.append(f"  {ver}/* — {count} failures")
+    if insights["dead_branches"]:
+        pattern_lines.append("Dead path branches (multiple failures, nothing alive under them):")
+        for branch, count in sorted(insights["dead_branches"].items(), key=lambda x: -x[1])[:12]:
+            pattern_lines.append(f"  {branch}/* — {count} failures")
+
+    section2 = ""
+    if pattern_lines:
+        section2 = "\n\n=== DEAD PATTERNS — DO NOT EXPLORE ===\n" + "\n".join(pattern_lines)
+
+    # --- Section 3: full dead list for deduplication (capped) ---
+    cap = 250
+    sample = dead_urls[-cap:]
+    section3 = (
+        f"\n\n=== ALREADY TRIED — DO NOT REPEAT "
+        f"({len(dead_urls)} total, showing {len(sample)}) ===\n"
+        + "\n".join(sample)
+    ) if dead_urls else ""
+
+    return (
+        f"{section1}"
+        f"{section2}"
+        f"{section3}\n\n"
+        f"Generate {candidates} new URL candidates anchored to the CONFIRMED ALIVE list.\n"
+        f"Avoid every pattern and URL listed above."
     )
 
 
@@ -521,17 +687,23 @@ def run_url_mode(config: dict) -> dict:
     scope_status = f"enabled ({config['scope_file']})" if config["scope_domains"] else "disabled"
     print(f"[*] Scope: {scope_status}")
 
-    confirmed_urls: set[str] = set(seeds)
     alive_hosts: list[dict] = []
     rounds_summary: list[dict] = []
+    # All URLs ever probed (seeds + every candidate tried), used to avoid LLM repetition
+    all_tried: set[str] = set(seeds)
 
     for round_num in range(1, config["rounds"] + 1):
         print(f"\n[Round {round_num}/{config['rounds']}]")
 
         system_prompt = build_url_system_prompt(config["context"], config["candidates"])
-        user_message = build_user_message(list(confirmed_urls), "url", config["candidates"])
+        user_message = build_url_user_message(
+            alive_hosts, all_tried, seeds, config["candidates"]
+        )
 
-        print(f"  [*] Calling LLM (context: {len(confirmed_urls)} confirmed URLs)...")
+        print(
+            f"  [*] Calling LLM "
+            f"(alive: {len(alive_hosts)}, tried: {len(all_tried)})..."
+        )
         raw_candidates = call_llm(
             system_prompt, user_message,
             config["api_key"], config["model"], config["llm_url"], config["delay"],
@@ -548,13 +720,12 @@ def run_url_mode(config: dict) -> dict:
         scope_rejected += rej
         print(f"  [*] Scope filtered: {rej}")
 
-        new_candidates = [c for c in kept if c not in confirmed_urls]
+        new_candidates = [c for c in kept if c not in all_tried]
+        all_tried.update(new_candidates)
         print(f"  [*] Deduped: {len(new_candidates)} new candidates to probe")
 
         ua = random.choice(config["user_agents"])
         new_alive = run_httpx(new_candidates, ua, config["delay"])
-        new_alive_urls = {h["url"] for h in new_alive}
-        confirmed_urls.update(new_alive_urls)
         alive_hosts.extend(new_alive)
 
         if not new_alive:
@@ -566,9 +737,11 @@ def run_url_mode(config: dict) -> dict:
             "round": round_num,
             "llm": len(raw_candidates),
             "scope_filtered": rej,
+            "probed": len(new_candidates),
             "alive": len(new_alive),
         })
 
+    confirmed_urls = set(seeds) | {h["url"] for h in alive_hosts}
     return {
         "mode": "url",
         "seeds": seeds,
@@ -590,6 +763,50 @@ def _fmt_alive_line(h: dict) -> str:
     return f"{h['url']} | {status} | {title} | {server} | {cl}"
 
 
+def _group_url_results(alive_hosts: list[dict]) -> dict:
+    """Splits alive hosts into status-code buckets for url mode output."""
+    groups: dict[str, list[dict]] = {
+        "open":     [],   # 200-299
+        "redirect": [],   # 300-399
+        "auth":     [],   # 401, 403
+        "error":    [],   # 500-599
+        "other":    [],   # 404, etc.
+    }
+    for h in sorted(alive_hosts, key=lambda x: x["url"]):
+        code = h["status_code"]
+        if 200 <= code < 300:
+            groups["open"].append(h)
+        elif 300 <= code < 400:
+            groups["redirect"].append(h)
+        elif code in (401, 403):
+            groups["auth"].append(h)
+        elif 500 <= code < 600:
+            groups["error"].append(h)
+        else:
+            groups["other"].append(h)
+    return groups
+
+
+def _fmt_url_group_txt(label: str, hosts: list[dict]) -> list[str]:
+    """Renders one status-code group as aligned text lines."""
+    if not hosts:
+        return []
+    lines = [f"### {label} ({len(hosts)})", ""]
+    # Compute column widths
+    url_w = max(len(h["url"]) for h in hosts)
+    for h in hosts:
+        status = str(h["status_code"])
+        if h.get("redirect"):
+            status = f"{status} -> {h['redirect']}"
+        title = h.get("title") or ""
+        cl = f"{h['content_length']}B" if h.get("content_length") is not None else ""
+        url_col = h["url"].ljust(url_w)
+        detail = "  ".join(filter(None, [title, cl]))
+        lines.append(f"  {url_col}  {status:<6}  {detail}".rstrip())
+    lines.append("")
+    return lines
+
+
 def write_txt_output(results: dict, config: dict):
     filepath = config["output"] + ".txt"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -598,25 +815,7 @@ def write_txt_output(results: dict, config: dict):
     alive_hosts = results["alive_hosts"]
     alive_urls = {h["url"] for h in alive_hosts}
 
-    if mode in ("domain", "llm"):
-        confirmed = set(results["confirmed_domains"])
-        dns_only = sorted(confirmed - {
-            h["url"].replace("https://", "").replace("http://", "").split("/")[0]
-            for h in alive_hosts
-        })
-        candidates_not_resolved = sorted(
-            set(results.get("all_candidates", [])) - confirmed
-        )
-    else:
-        confirmed_urls = set(results["confirmed_urls"])
-        dns_only = sorted(confirmed_urls - alive_urls)
-        candidates_not_resolved = []
-
-    seeds_set = set(results.get("seeds", []))
-    llm_alive = [h for h in alive_hosts if
-                 h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
-
-    lines = [
+    header = [
         "# reconai output",
         f"# Mode    : {mode}",
         f"# Input   : {config['input']}",
@@ -625,21 +824,56 @@ def write_txt_output(results: dict, config: dict):
         f"# Date    : {date_str}",
         "# ============================================================",
         "",
-        "## ALIVE (HTTP probe confirmed)",
     ]
-    for h in alive_hosts:
-        lines.append(_fmt_alive_line(h))
 
-    if mode == "llm":
-        lines += ["", "## LLM-DISCOVERED & ALIVE"]
-        lines += [_fmt_alive_line(h) for h in llm_alive] if llm_alive else ["(none)"]
+    if mode == "url":
+        groups = _group_url_results(alive_hosts)
+        confirmed_urls = set(results["confirmed_urls"])
+        not_alive = sorted(confirmed_urls - alive_urls)
 
-    lines += ["", "## CONFIRMED (DNS resolved, not HTTP probed or not alive)"]
-    lines += dns_only if dns_only else ["(none)"]
+        body = [f"## RESULTS — {len(alive_hosts)} endpoints responded", ""]
+        body += _fmt_url_group_txt("OPEN (200-299)", groups["open"])
+        body += _fmt_url_group_txt("AUTH-GATED (401/403) — path confirmed, needs credentials", groups["auth"])
+        body += _fmt_url_group_txt("REDIRECTS (3xx)", groups["redirect"])
+        body += _fmt_url_group_txt("SERVER ERRORS (5xx) — path exists but erroring", groups["error"])
+        body += _fmt_url_group_txt("OTHER", groups["other"])
 
-    lines += ["", "## CANDIDATES (LLM generated, not resolved)"]
-    lines += candidates_not_resolved if candidates_not_resolved else ["(none)"]
+        if not_alive:
+            body += ["## SEEDS / NOT ALIVE"]
+            body += not_alive
+            body += [""]
+    else:
+        if mode in ("domain", "llm"):
+            confirmed = set(results["confirmed_domains"])
+            dns_only = sorted(confirmed - {
+                h["url"].replace("https://", "").replace("http://", "").split("/")[0]
+                for h in alive_hosts
+            })
+            candidates_not_resolved = sorted(
+                set(results.get("all_candidates", [])) - confirmed
+            )
+        else:
+            confirmed_urls = set(results["confirmed_urls"])
+            dns_only = sorted(confirmed_urls - alive_urls)
+            candidates_not_resolved = []
 
+        seeds_set = set(results.get("seeds", []))
+        llm_alive = [h for h in alive_hosts if
+                     h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
+
+        body = ["## ALIVE (HTTP probe confirmed)"]
+        body += [_fmt_alive_line(h) for h in alive_hosts] or ["(none)"]
+
+        if mode == "llm":
+            body += ["", "## LLM-DISCOVERED & ALIVE"]
+            body += [_fmt_alive_line(h) for h in llm_alive] if llm_alive else ["(none)"]
+
+        body += ["", "## CONFIRMED (DNS resolved, not HTTP probed or not alive)"]
+        body += dns_only if dns_only else ["(none)"]
+        body += ["", "## CANDIDATES (LLM generated, not resolved)"]
+        body += candidates_not_resolved if candidates_not_resolved else ["(none)"]
+
+    lines = header + body
     try:
         with open(filepath, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -657,48 +891,124 @@ def write_html_output(results: dict, config: dict):
     alive_hosts = results["alive_hosts"]
     alive_urls = {h["url"] for h in alive_hosts}
 
-    if mode in ("domain", "llm"):
-        confirmed = set(results["confirmed_domains"])
-        dns_only = sorted(confirmed - {
-            h["url"].replace("https://", "").replace("http://", "").split("/")[0]
-            for h in alive_hosts
-        })
-        candidates_not_resolved = sorted(
-            set(results.get("all_candidates", [])) - confirmed
-        )
-    else:
-        confirmed_urls = set(results["confirmed_urls"])
-        dns_only = sorted(confirmed_urls - alive_urls)
-        candidates_not_resolved = []
-
-    seeds_set = set(results.get("seeds", []))
-    llm_alive = [h for h in alive_hosts if
-                 h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
-
     def esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in alive_hosts) or "  <li>(none)</li>"
-    dns_items = "\n".join(f"  <li>{esc(d)}</li>" for d in dns_only) or "  <li>(none)</li>"
-    cand_items = "\n".join(f"  <li>{esc(c)}</li>" for c in candidates_not_resolved) or "  <li>(none)</li>"
+    if mode == "url":
+        groups = _group_url_results(alive_hosts)
+        confirmed_urls = set(results["confirmed_urls"])
+        not_alive = sorted(confirmed_urls - alive_urls)
 
-    llm_alive_section = ""
-    if mode == "llm":
-        llm_alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in llm_alive) or "  <li>(none)</li>"
-        llm_alive_section = f"""
+        status_colors = {
+            "open":     ("#d4edda", "#155724"),
+            "auth":     ("#fff3cd", "#856404"),
+            "redirect": ("#d1ecf1", "#0c5460"),
+            "error":    ("#f8d7da", "#721c24"),
+            "other":    ("#e2e3e5", "#383d41"),
+        }
+
+        def group_rows(key: str, hosts: list[dict]) -> str:
+            if not hosts:
+                return ""
+            bg, fg = status_colors[key]
+            rows = []
+            for h in hosts:
+                status = str(h["status_code"])
+                if h.get("redirect"):
+                    status = f"{status} → {esc(h['redirect'])}"
+                title = esc(h.get("title") or "")
+                cl = f"{h['content_length']}B" if h.get("content_length") is not None else ""
+                rows.append(
+                    f'<tr style="background:{bg};color:{fg}">'
+                    f'<td><a href="{esc(h["url"])}" target="_blank">{esc(h["url"])}</a></td>'
+                    f"<td>{status}</td><td>{title}</td><td>{cl}</td></tr>"
+                )
+            return "\n".join(rows)
+
+        table_rows = (
+            group_rows("open", groups["open"])
+            + group_rows("auth", groups["auth"])
+            + group_rows("redirect", groups["redirect"])
+            + group_rows("error", groups["error"])
+            + group_rows("other", groups["other"])
+        )
+
+        counts = {k: len(v) for k, v in groups.items()}
+        legend = (
+            f'<span style="background:#d4edda;color:#155724;padding:2px 8px">Open: {counts["open"]}</span> '
+            f'<span style="background:#fff3cd;color:#856404;padding:2px 8px">Auth-gated: {counts["auth"]}</span> '
+            f'<span style="background:#d1ecf1;color:#0c5460;padding:2px 8px">Redirects: {counts["redirect"]}</span> '
+            f'<span style="background:#f8d7da;color:#721c24;padding:2px 8px">5xx errors: {counts["error"]}</span>'
+        )
+
+        not_alive_rows = "\n".join(f"<li>{esc(u)}</li>" for u in not_alive)
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>reconai — url — {esc(date_str)}</title>
+<style>
+  body {{ font-family: monospace; font-size: 13px; margin: 20px; }}
+  h1 {{ font-size: 18px; }} h2 {{ font-size: 14px; margin-top: 24px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th {{ background: #343a40; color: #fff; text-align: left; padding: 6px 10px; }}
+  td {{ padding: 4px 10px; border-bottom: 1px solid #dee2e6; word-break: break-all; }}
+  a {{ color: inherit; }}
+</style>
+</head>
+<body>
+<h1>reconai output</h1>
+<p>Mode: url &nbsp;|&nbsp; Input: {esc(config['input'])} &nbsp;|&nbsp; Rounds: {config['rounds']} &nbsp;|&nbsp; Date: {esc(date_str)}</p>
+<p>{legend}</p>
+<h2>Endpoints ({len(alive_hosts)} responded)</h2>
+<table>
+<tr><th>URL</th><th>Status</th><th>Title</th><th>Size</th></tr>
+{table_rows}
+</table>
+{"<h2>Seeds / Not Alive</h2><ul>" + not_alive_rows + "</ul>" if not_alive else ""}
+</body>
+</html>
+"""
+    else:
+        if mode in ("domain", "llm"):
+            confirmed = set(results["confirmed_domains"])
+            dns_only = sorted(confirmed - {
+                h["url"].replace("https://", "").replace("http://", "").split("/")[0]
+                for h in alive_hosts
+            })
+            candidates_not_resolved = sorted(
+                set(results.get("all_candidates", [])) - confirmed
+            )
+        else:
+            confirmed_urls = set(results["confirmed_urls"])
+            dns_only = sorted(confirmed_urls - alive_urls)
+            candidates_not_resolved = []
+
+        seeds_set = set(results.get("seeds", []))
+        llm_alive = [h for h in alive_hosts if
+                     h["url"].replace("https://", "").replace("http://", "").split("/")[0] not in seeds_set]
+
+        alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in alive_hosts) or "  <li>(none)</li>"
+        dns_items = "\n".join(f"  <li>{esc(d)}</li>" for d in dns_only) or "  <li>(none)</li>"
+        cand_items = "\n".join(f"  <li>{esc(c)}</li>" for c in candidates_not_resolved) or "  <li>(none)</li>"
+
+        llm_alive_section = ""
+        if mode == "llm":
+            llm_alive_items = "\n".join(f"  <li>{esc(_fmt_alive_line(h))}</li>" for h in llm_alive) or "  <li>(none)</li>"
+            llm_alive_section = f"""
 <h2>LLM-Discovered &amp; Alive ({len(llm_alive)})</h2>
 <ul>
 {llm_alive_items}
 </ul>
 """
 
-    html = f"""<!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
 <html>
 <head><title>reconai output — {esc(mode)} — {esc(date_str)}</title></head>
 <body>
 <h1>reconai output</h1>
 <p>Mode: {esc(mode)} | Input: {esc(config['input'])} | Rounds: {config['rounds']} | Date: {esc(date_str)}</p>
-
 <h2>Alive ({len(alive_hosts)})</h2>
 <ul>
 {alive_items}
@@ -708,15 +1018,14 @@ def write_html_output(results: dict, config: dict):
 <ul>
 {dns_items}
 </ul>
-
 <h2>Candidates — not resolved ({len(candidates_not_resolved)})</h2>
 <ul>
 {cand_items}
 </ul>
-
 </body>
 </html>
 """
+
     try:
         with open(filepath, "w") as f:
             f.write(html)
@@ -730,7 +1039,36 @@ def print_final_summary(results: dict, config: dict):
     print(f"\n{sep}")
     print("reconai | COMPLETE")
     print(sep)
-    if results["mode"] in ("domain", "llm"):
+
+    if results["mode"] == "url":
+        groups = _group_url_results(results["alive_hosts"])
+        print(f"  Total alive               : {len(results['alive_hosts'])}")
+        print(f"  Scope rejected            : {results['scope_rejected']}")
+        print()
+
+        labels = [
+            ("open",     "OPEN (200-299)           "),
+            ("auth",     "AUTH-GATED (401/403)     "),
+            ("redirect", "REDIRECTS (3xx)          "),
+            ("error",    "SERVER ERRORS (5xx)      "),
+            ("other",    "OTHER                    "),
+        ]
+        for key, label in labels:
+            hosts = groups[key]
+            if not hosts:
+                continue
+            print(f"  {label}  {len(hosts)} endpoints")
+            print(f"  {'-' * 56}")
+            for h in hosts:
+                status = str(h["status_code"])
+                if h.get("redirect"):
+                    status = f"{status} -> {h['redirect']}"
+                title = f"  [{h['title']}]" if h.get("title") else ""
+                cl = f"  {h['content_length']}B" if h.get("content_length") is not None else ""
+                print(f"    {h['url']}  {status}{title}{cl}")
+            print()
+
+    elif results["mode"] in ("domain", "llm"):
         print(f"  Total confirmed subdomains : {len(results['confirmed_domains'])}")
         if results["mode"] == "llm":
             new_domains = sorted(set(results["confirmed_domains"]) - set(results["seeds"]))
@@ -740,10 +1078,9 @@ def print_final_summary(results: dict, config: dict):
                 print("  LLM-discovered & DNS-validated:")
                 for d in new_domains:
                     print(f"    + {d}")
-    else:
-        print(f"  Total confirmed URLs       : {len(results['confirmed_urls'])}")
-    print(f"  Total alive (HTTP)         : {len(results['alive_hosts'])}")
-    print(f"  Scope rejected             : {results['scope_rejected']}")
+        print(f"  Total alive (HTTP)         : {len(results['alive_hosts'])}")
+        print(f"  Scope rejected             : {results['scope_rejected']}")
+
     print("  Output files:")
 
 
