@@ -55,8 +55,4 @@ tempCodeRunnerFile.py
 .claude/
 
 # reconai — tool outputs and input files with real targets
-*_output.txt
-*_output.html
-*.html
-# Uncomment below to also ignore all .txt input files (keep requirements.txt and useragents.txt tracked manually)
-# *.txt
+runs/
